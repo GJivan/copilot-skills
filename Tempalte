@@ -1,0 +1,119 @@
+You are helping me decide the future of our Kubernetes deployment tooling. Work read-only: do not modify, commit or push anything in the repos. Do not decrypt or print secret values. Write your report outside the repos, or in chat if you can't write files.
+
+## Background
+
+We deploy a product of ~65–70 Helm releases to OpenShift. The internal flow is CI-triggered and push-based:
+- A CI job resolves one pinned assembly version from a central version catalog. That version maps every chart version and image tag.
+- A custom CLI wrapper sets env vars and paths, then runs Helmfile.
+- A root helmfile includes domain helmfiles (infrastructure, legacy/middleware, microservices, workflow, integration, add-ons), which glob per-service helmfiles. About 42 microservices share one generic chart.
+- Values are layered from lowest to highest precedence: assembly defaults (including a ~6.6k-line defaults file), an optional customer extension layer, shared-environment overrides, then environment overrides. SOPS-encrypted secrets are layered at the shared-environment and environment levels through helm-secrets. Environment override files live outside the assembly repo.
+- 71 .gotmpl files (~6.5k lines) compute the final values. Airflow is the outlier, with ~1.3k lines of templates plus a Kustomize jsonPatch.
+- Helmfile runs once, in directory and include order, and the job ends. Nothing reconciles the environment or detects drift.
+- Liquibase database migrations run from Jenkins or manually. Two or three bare-metal deployments use Ansible or manual steps.
+- Clients deploy the product their own way.
+
+## What we're deciding
+
+We want to move toward GitOps with OpenShift GitOps (Argo CD), using only the abstractions we strictly need. The team has debated for a month whether Helmfile can be removed without losing its advantages: layered values, shared release templates, label selectors, glob discovery, and diff.
+
+Requirements:
+- Easy multi-environment provisioning. Ops fill out one environment config (Postgres location, certificate issuer, External Secrets store and path, domain, which stacks are on) and the environment deploys.
+- Developers can add a service without writing charts.
+- Ops care about the final production state; developers care about their own service.
+- The result should also be something we can hand to clients, some of whom may not run Argo.
+
+Already considered:
+- kro: not adopting. It's pre-1.0, adds an operator, and doesn't render Helm.
+- Kargo: later, and only for gated promotion between environments.
+
+## Options
+
+A. Argo-native.
+   - Move template logic into charts, using `tpl` and helpers in the generic chart, so values become static YAML.
+   - A small "product" chart loops over a catalog of apps and emits one Argo Application per enabled app.
+   - An ApplicationSet creates one root Application per environment from envs/<name>/env.yaml.
+   - Argo valueFiles reproduce the current layer order.
+   - Secrets move to External Secrets Operator.
+   - Liquibase becomes a PreSync Job.
+   - Namespace labelling moves to managedNamespaceMetadata.
+   - Directory ordering becomes sync waves.
+B. Helmfile renders, Argo applies. Run Helmfile as an Argo Config Management Plugin, or render in CI and commit the output for Argo to sync.
+C. Stay push-based for now. Keep Helmfile and fix validation, hooks and ordering first.
+
+## Part 1: Discovery
+
+Answer every question with evidence: file paths, line numbers, and counts where asked. Write "not found" instead of guessing. If you can't access something (for example the CLI repo or the CI config), say so.
+
+1. Cross-release logic (most important)
+1.1 For each `range` loop and each `define`/`include` in the global and per-family templates: what does it iterate over, what does it output, and which releases consume that output?
+1.2 Does any template compute values for one release from another release's values, or from a list of all services (URLs, endpoint lists, shared config)? List every case.
+
+2. Deploy-time inputs
+2.1 List every use of env, requiredEnv, exec, readFile, readDir, isFile, fetch, .Environment, .StateValues, and any --set or --state-values-set the CLI passes. For each, say what it supplies and whether it changes per environment.
+2.2 List every environment variable the CLI or the bootstrap script reads or sets, and what each one controls.
+
+3. .gotmpl triage
+Produce a table of all .gotmpl files with these columns: path, line count, number of template expressions, and a bucket:
+  A = only get/default lookups
+  B = string building (hostnames, URLs, concatenation)
+  C = conditionals, loops, defines, or computed structures
+For each bucket C file, add one line on what the logic decides.
+
+4. Value layering
+4.1 Give the exact ordered list of values and secrets files passed to a typical generic-chart release, and the same list for Airflow. Include the extension layer and the missingFileHandler settings.
+4.2 Are override files one file per service, or global files that hold many services?
+
+5. The CLI
+List everything the CLI does before, during and after Helmfile runs: commands, flags, kubectl/oc calls, generated files, auth, cleanup. What would break if someone ran helmfile directly instead?
+
+6. Ordering
+6.1 What is the effective deploy order (tiers), and where does that order come from?
+6.2 Which dependencies are real? Check for: CRDs before custom resources, operators before their instances, databases or middleware before services, `needs`, `wait`, `waitForJobs`, and timeouts.
+
+7. Hooks and patches
+For each Helmfile hook, give its event, command and purpose. For the Airflow jsonPatch, say what it changes and whether the chart exposes a value that could do the same thing.
+
+8. Charts
+8.1 What resources does the generic chart render? Does it use tpl, lookup, Helm hooks, or a values.schema.json?
+8.2 List every release that does not use the generic chart, with chart name, source and version.
+8.3 List any use of non-deterministic functions in charts or templates: randAlphaNum, randAlpha, uuidv4, genCA, genSelfSignedCert, genPrivateKey, now, date. These produce a new value on every render, which leaves Argo showing the app as permanently out of sync.
+8.4 List any CRDs or operators installed by any release.
+
+9. Secrets
+Describe the structure of the secrets files (key names only, never values) and which releases consume them and how. Give the SOPS key type (age, PGP or KMS) and where the .sops.yaml rules live.
+
+10. Selectors and flags
+List the label schema, every label value in use, and every enabled flag. Which selectors do CI jobs or docs actually use?
+
+11. Extension layer
+How are extension services and values discovered and merged? Is there any evidence of real consumers?
+
+12. Versions
+List every place a chart version or image tag is defined (catalog, manifests, Chart.yaml, helmfiles), and say which one wins at deploy time.
+
+13. Environments and release identity
+13.1 Is an environment a cluster, a namespace, or several namespaces? How many sample environments exist?
+13.2 What is the release naming and namespace pattern? Do the charts set app.kubernetes.io/instance themselves?
+
+14. Database and bare metal
+How does Liquibase run: which pipeline, what triggers it, and is it per service or shared? What does the bare-metal Ansible cover?
+
+## Part 2: Decision
+
+Apply this rubric and recommend one option. Show which findings drive the choice.
+
+- Cross-release logic (1.2): a few isolated cases favors A; move them into the product chart or into static data. Wiring that many releases consume favors B.
+- .gotmpl buckets (3): if most files are bucket A or B, conversion is mechanical and favors A. If bucket C logic is common outside the global templates and Airflow, estimate the effort before committing to A.
+- Deploy-time inputs (2): under A or B, every env var, exec or readFile that varies per environment must become data in git. Count them; a long list raises effort for both.
+- CLI duties (5): every duty needs a named replacement (Argo, CI, Kargo, or dropped). Any duty with no home is a blocker to resolve first.
+- Non-deterministic functions (8.3) and lookup: these must be fixed under A or B either way.
+- Secrets (9): if SOPS must stay in git, B is simpler short-term. Moving to External Secrets fits A.
+- Client handoff: if clients must install without Argo, the charts and static values must stay usable with plain Helm or a thin Helmfile.
+
+## Output
+
+Produce one markdown report, deployment-discovery.md, containing:
+1. The Part 1 answers, numbered to match the questions.
+2. The .gotmpl triage table.
+3. The recommendation: the chosen option, the findings that drive it, the top three risks, and the first three concrete steps.
+4. Anything surprising or inconsistent you found.
